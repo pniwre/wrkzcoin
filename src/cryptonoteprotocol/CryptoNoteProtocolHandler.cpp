@@ -914,6 +914,36 @@ namespace CryptoNote
 
         if (context.m_requested_objects.size())
         {
+            /* A peer that reorganised, or pruned an alternative chain, between
+               answering our chain request and this one no longer has some of
+               the blocks it listed for us, and says so in missed_ids. That is
+               not misbehaviour - its chain is simply not the one we were told
+               about - so throw the stale list away and ask for the chain
+               again. The blocks it did send go with it; the fresh chain entry
+               lists them again if they still matter. Anything left over that
+               it did not declare missing is a short answer and costs the
+               connection as before. */
+            const bool allDeclaredMissing = std::all_of(
+                context.m_requested_objects.begin(),
+                context.m_requested_objects.end(),
+                [&arg](const Crypto::Hash &hash) {
+                    return std::find(arg.missed_ids.begin(), arg.missed_ids.end(), hash) != arg.missed_ids.end();
+                });
+
+            if (allDeclaredMissing)
+            {
+                logger(Logging::INFO) << context << "Peer no longer has " << context.m_requested_objects.size()
+                                      << " of the blocks it listed for us (reorganised or pruned an alternative "
+                                         "chain), re-requesting chain";
+                context.m_needed_objects.clear();
+                context.m_requested_objects.clear();
+                context.m_state = CryptoNoteConnectionContext::state_synchronizing;
+                NOTIFY_REQUEST_CHAIN::request req {};
+                req.block_ids = m_core.buildSparseChain();
+                post_notify<NOTIFY_REQUEST_CHAIN>(*m_p2p, req, context);
+                return 1;
+            }
+
             onSyncChunkFailure(context);
             logger(Logging::ERROR, Logging::BRIGHT_RED)
                 << context << "returned not all requested objects (context.m_requested_objects.size()="

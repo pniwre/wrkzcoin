@@ -1337,6 +1337,11 @@ namespace CryptoNote
         std::vector<BinaryArray> &transactions,
         std::vector<Crypto::Hash> &missedHashes) const
     {
+        /* Walks every alternative leaf, which addBlock prunes under this mutex.
+           Reached from the RPC threads for wallets and from the P2P thread for
+           NOTIFY_MISSING_TXS. */
+        std::shared_lock lock(m_chainMutex);
+
         assert(!chainsLeaves.empty());
         assert(!chainsStorage.empty());
         throwIfNotInitialized();
@@ -1421,6 +1426,13 @@ namespace CryptoNote
     {
         assert(!remoteBlockIds.empty());
         assert(remoteBlockIds.back() == getBlockHashByIndex(0));
+
+        /* Serves NOTIFY_REQUEST_CHAIN. The height, the fork point and the hash
+           list below have to come from one chain: a reorg landing between them
+           gives the peer a chain entry it will reject as inconsistent. Same
+           race as getBlocks, same lock. */
+        std::shared_lock lock(m_chainMutex);
+
         throwIfNotInitialized();
 
         totalBlockCount = getTopBlockIndex() + 1;
@@ -2276,6 +2288,14 @@ namespace CryptoNote
         uint64_t &difficulty,
         uint32_t &height)
     {
+        /* Miners poll this from the RPC threads while the P2P thread adds
+           blocks. Height, difficulty and the parent hash are read separately
+           below, and a block arriving in between hands the miner a template
+           that mixes two chains - work that is rejected on submit, or worse,
+           a block that ends up as an alternative. Hold the chain still for
+           the whole build. */
+        std::shared_lock lock(m_chainMutex);
+
         throwIfNotInitialized();
 
         height = getTopBlockIndex() + 1;
