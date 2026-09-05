@@ -446,13 +446,23 @@ namespace CryptoNote
                 exit(1);
             }
         }
-        context.m_sync_batch_size = m_syncBatchMin;
-        context.m_sync_failures = 0;
-        context.m_sync_orphan_retries = 0;
-        context.m_sync_blocks_per_second = 0.0f;
-        context.m_sync_chunk_start_time = {};
-        context.m_pipelined_objects_outstanding = false;
-        context.m_discard_next_objects_response = false;
+        /* Only a handshake starts a fresh sync relationship. This also runs for
+           every timed sync, once a minute, and those arrive in the middle of a
+           sync - including between a batch we abandoned and the pipelined reply
+           to it that is still in flight. Wiping m_discard_next_objects_response
+           there made that reply look like blocks we never asked for, and the
+           peer was dropped for it. Knocking the adaptive batch size back to the
+           minimum every minute was not intended either. */
+        if (is_initial)
+        {
+            context.m_sync_batch_size = m_syncBatchMin;
+            context.m_sync_failures = 0;
+            context.m_sync_orphan_retries = 0;
+            context.m_sync_blocks_per_second = 0.0f;
+            context.m_sync_chunk_start_time = {};
+            context.m_pipelined_objects_outstanding = false;
+            context.m_discard_next_objects_response = false;
+        }
 
         if (context.m_state == CryptoNoteConnectionContext::state_befor_handshake && !is_initial)
         {

@@ -492,6 +492,14 @@ namespace CryptoNote
         std::vector<RawBlock> &blocks,
         std::vector<Crypto::Hash> &missedHashes) const
     {
+        /* Reads chainsLeaves and walks the chain segments, both of which
+           addBlock mutates under the same mutex. The mining RPC threads add
+           blocks - and switch chains - while the P2P thread is in here, and a
+           hash resolved against the old chain read back the block the new chain
+           put at that height. The peer then received a block it never asked
+           for and dropped us for it. */
+        std::shared_lock lock(m_chainMutex);
+
         throwIfNotInitialized();
 
         /* This serves NOTIFY_REQUEST_GET_OBJECTS, so it is asked for hundreds of
