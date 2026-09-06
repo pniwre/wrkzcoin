@@ -805,6 +805,11 @@ namespace CryptoNote
      */
     std::unique_ptr<IBlockchainCache> DatabaseBlockchainCache::split(uint32_t splitBlockIndex)
     {
+        /* Undoing blocks invalidates the bulk load memos wholesale, so close it
+           rather than reason about which entries survive. Nothing does this
+           during an import; it is here so nothing ever can. */
+        endBulkLoad();
+
         assert(splitBlockIndex <= getTopBlockIndex());
 
         /* Splitting means undoing blocks, which needs the transaction records and
@@ -902,6 +907,9 @@ namespace CryptoNote
 
     void DatabaseBlockchainCache::rewind(const uint64_t height)
     {
+        /* See split(): a rewind invalidates the bulk load memos. */
+        endBulkLoad();
+
         /* Same reasoning as split(): the blocks below the lite height cannot be
            undone because what undoing them needs was never written. Checked
            before the height <= 1 shortcut, so a lite node cannot quietly wipe
@@ -1419,18 +1427,38 @@ namespace CryptoNote
         const Crypto::Hash &transactionHash,
         const Crypto::Hash &paymentId)
     {
-        BlockchainReadBatch readBatch;
         uint32_t count = 0;
 
-        auto readResult = readDatabase(readBatch.requestTransactionCountByPaymentId(paymentId));
-        if (readResult.getTransactionCountByPaymentIds().count(paymentId) != 0)
+        const auto memo = bulkPaymentIdCounts.find(paymentId);
+
+        if (memo != bulkPaymentIdCounts.end())
         {
-            count = readResult.getTransactionCountByPaymentIds().at(paymentId);
+            count = memo->second;
+        }
+        /* A miss on an authoritative memo means this payment id has not been
+           seen at all, so there is nothing to read. Otherwise ask the database -
+           readDatabase flushes any pending bulk batch first, so the count it
+           returns includes the blocks still buffered. */
+        else if (!bulkMemosAuthoritative || bulkPaymentIdsHaveEvicted)
+        {
+            BlockchainReadBatch readBatch;
+
+            auto readResult = readDatabase(readBatch.requestTransactionCountByPaymentId(paymentId));
+
+            if (readResult.getTransactionCountByPaymentIds().count(paymentId) != 0)
+            {
+                count = readResult.getTransactionCountByPaymentIds().at(paymentId);
+            }
         }
 
         count += 1;
 
         batch.insertPaymentId(transactionHash, paymentId, count);
+
+        if (bulkBatchBlockLimit != 0)
+        {
+            rememberBulkPaymentIdCount(paymentId, count);
+        }
     }
 
     void DatabaseBlockchainCache::insertBlockTimestamp(
@@ -1438,20 +1466,46 @@ namespace CryptoNote
         uint64_t timestamp,
         const Crypto::Hash &blockHash)
     {
-        BlockchainReadBatch readBatch;
-        readBatch.requestBlockHashesByTimestamp(timestamp);
-
         std::vector<Crypto::Hash> blockHashes;
-        auto readResult = readDatabase(readBatch);
 
-        if (readResult.getBlockHashesByTimestamp().count(timestamp) != 0)
+        const auto memo = bulkTimestamps.find(timestamp);
+
+        /* Whether a memo miss settles the question. Only during an authoritative
+           bulk load, and then only for a timestamp above everything the memo has
+           evicted - anything written is either still remembered or was evicted,
+           and every eviction is at or below that mark. Block timestamps climb,
+           so this holds for effectively every block and removes what is
+           otherwise a database read per block. */
+        const bool missIsConclusive = bulkMemosAuthoritative
+            && (!bulkTimestampsHaveEvicted || timestamp > bulkTimestampsHighestEvicted);
+
+        if (memo != bulkTimestamps.end())
         {
-            blockHashes = readResult.getBlockHashesByTimestamp().at(timestamp);
+            blockHashes = memo->second;
+        }
+        else if (!missIsConclusive)
+        {
+            BlockchainReadBatch readBatch;
+            readBatch.requestBlockHashesByTimestamp(timestamp);
+
+            /* readDatabase flushes any pending bulk batch first, so this sees
+               the blocks still buffered as well as those on disk. */
+            auto readResult = readDatabase(readBatch);
+
+            if (readResult.getBlockHashesByTimestamp().count(timestamp) != 0)
+            {
+                blockHashes = readResult.getBlockHashesByTimestamp().at(timestamp);
+            }
         }
 
         blockHashes.emplace_back(blockHash);
 
         batch.insertTimestamp(timestamp, blockHashes);
+
+        if (bulkBatchBlockLimit != 0)
+        {
+            rememberBulkTimestamp(timestamp, blockHashes);
+        }
     }
 
     void DatabaseBlockchainCache::pushBlock(
@@ -1524,6 +1578,14 @@ namespace CryptoNote
            dead weight down there. */
         if (!indexOnly && knownClosestTimestampMidnight != blockMidnight)
         {
+            /* One of the few reads that goes to the database without passing
+               through readDatabase, so it has to flush for itself. Block
+               timestamps are only nearly ordered, and a run that crosses back
+               over a midnight would otherwise not see the entry it wrote for
+               that day still sitting in the pending batch, and would write a
+               second one naming a later block as the day's first. */
+            flushBulkBatch();
+
             auto closestBlockIndexDb = requestClosestBlockIndexByTimestamp(blockMidnight, database);
             if (!closestBlockIndexDb.second)
             {
@@ -1545,11 +1607,34 @@ namespace CryptoNote
 
         const bool durable = shouldSyncBlockWrite(getTopBlockIndex() + 1, cachedBlock.getBlock().timestamp);
 
-        auto res = database.write(batch, durable);
-        if (res)
+        if (bulkBatchBlockLimit != 0)
         {
-            logger(Logging::ERROR) << "push block " << cachedBlock.getBlockHash() << " write failed: " << res.message();
-            throw std::runtime_error(res.message());
+            /* Handed over whole, and only here at the end.
+
+               readDatabase flushes the pending batch, and one of the lookups
+               above can still reach it - so the block being built must not be
+               in that batch yet. A flush that cut a block in half would put the
+               chain's top index on disk without the block it names, which is
+               the one thing an atomic per block write exists to prevent. */
+            bulkBatch.append(std::move(batch));
+
+            bulkBatchNeedsSync = bulkBatchNeedsSync || durable;
+            bulkBatchBlocks++;
+
+            if (bulkBatchBlocks >= bulkBatchBlockLimit)
+            {
+                flushBulkBatch();
+            }
+        }
+        else
+        {
+            auto res = database.write(batch, durable);
+            if (res)
+            {
+                logger(Logging::ERROR) << "push block " << cachedBlock.getBlockHash()
+                                       << " write failed: " << res.message();
+                throw std::runtime_error(res.message());
+            }
         }
 
         topBlockIndex = *topBlockIndex + 1;
@@ -1562,12 +1647,14 @@ namespace CryptoNote
             unitsCache.pop_front();
         }
 
-        /* Set only now the write has gone through, so a failed push cannot
-           leave us believing in an entry that was never committed. Index only
-           heights never wrote one, so they must not claim the day is covered
-           either: the lite height can fall mid day, and the first full block
-           after it would otherwise skip the lookup and leave that day with no
-           closest timestamp entry at all. */
+        /* Set only now the write has gone through - or, under a bulk load, now
+           the batch that carries it has been handed over and can only be
+           written or lost whole - so a failed push cannot leave us believing in
+           an entry that was never committed. Index only heights never wrote
+           one, so they must not claim the day is covered either: the lite
+           height can fall mid day, and the first full block after it would
+           otherwise skip the lookup and leave that day with no closest
+           timestamp entry at all. */
         if (!indexOnly)
         {
             knownClosestTimestampMidnight = blockMidnight;
@@ -1683,6 +1770,12 @@ namespace CryptoNote
     {
         if (!topBlockIndex)
         {
+            /* Reads the database directly rather than through readDatabase, so
+               it has to do readDatabase's job of not reading around a bulk
+               load's buffered blocks. In practice this branch is taken once,
+               before any of them exist. */
+            flushBulkBatch();
+
             auto batch = BlockchainReadBatch().requestLastBlockIndex();
             auto result = database.read(batch);
 
@@ -1721,6 +1814,9 @@ namespace CryptoNote
     {
         if (!transactionsCount)
         {
+            /* Direct read, so it flushes for itself - see getTopBlockIndex. */
+            flushBulkBatch();
+
             auto batch = BlockchainReadBatch().requestTransactionsCount();
             auto result = database.read(batch);
 
@@ -2561,11 +2657,27 @@ namespace CryptoNote
         auto rawBlocks = readDatabase(blockBatch).getRawBlocks();
 
         std::vector<RawBlock> orderedBlocks;
+        orderedBlocks.reserve(rawBlocks.size());
 
-        /* Order, and convert from map, to vector */
-        for (uint64_t height = startHeight; height < startHeight + rawBlocks.size(); height++)
+        /* Order, and convert from map, to vector.
+
+           Blocks a lite node never stored, and blocks pruning removed, are
+           simply absent from the map - MultiGet drops keys it cannot find
+           rather than reporting them. So the run has to stop at the first gap.
+           Sizing the loop by rawBlocks.size() as this used to would walk past a
+           gap and throw out of at(), or, when the gap was at the front, hand
+           back a dense looking vector of blocks that begin somewhere other than
+           startHeight - which every caller then numbers wrongly. */
+        for (uint64_t height = startHeight; height < endHeight; height++)
         {
-            orderedBlocks.push_back(rawBlocks.at(height));
+            const auto block = rawBlocks.find(static_cast<uint32_t>(height));
+
+            if (block == rawBlocks.end())
+            {
+                break;
+            }
+
+            orderedBlocks.push_back(block->second);
         }
 
         return orderedBlocks;
@@ -3385,6 +3497,13 @@ namespace CryptoNote
 
     BlockchainReadResult DatabaseBlockchainCache::readDatabase(BlockchainReadBatch &batch) const
     {
+        /* A bulk load keeps whole runs of blocks in memory before writing them,
+           and this read cannot see them. Flushing first is what makes every
+           reader in this class correct during an import without any of them
+           having to know an import is happening. The memos on the two hot
+           lookups are what keep this from firing once a block. */
+        flushBulkBatch();
+
         auto result = database.read(batch);
         if (result)
         {
@@ -3393,6 +3512,144 @@ namespace CryptoNote
         }
 
         return batch.extractResult();
+    }
+
+    void DatabaseBlockchainCache::beginBulkLoad(uint32_t blocksPerWrite)
+    {
+        if (blocksPerWrite == 0)
+        {
+            blocksPerWrite = 1;
+        }
+
+        /* Anything already pending belongs to whatever was running before, and
+           there should be nothing - but flushing costs nothing either. */
+        flushBulkBatch();
+
+        clearBulkLoadMemos();
+
+        /* Nothing above genesis means both memoised tables are empty on disk -
+           see bulkMemosAuthoritative - so from here on this class knows their
+           entire contents and never has to ask. */
+        bulkMemosAuthoritative = getTopBlockIndex() == 0;
+
+        bulkBatchBlockLimit = blocksPerWrite;
+
+        logger(Logging::DEBUGGING) << "bulk load opened, " << blocksPerWrite << " blocks per database write, memos "
+                                   << (bulkMemosAuthoritative ? "authoritative" : "advisory");
+    }
+
+    void DatabaseBlockchainCache::endBulkLoad()
+    {
+        flushBulkBatch();
+
+        bulkBatchBlockLimit = 0;
+
+        clearBulkLoadMemos();
+    }
+
+    void DatabaseBlockchainCache::clearBulkLoadMemos()
+    {
+        bulkMemosAuthoritative = false;
+
+        bulkTimestamps.clear();
+        bulkTimestampOrder.clear();
+        bulkTimestampsHighestEvicted = 0;
+        bulkTimestampsHaveEvicted = false;
+
+        bulkPaymentIdCounts.clear();
+        bulkPaymentIdOrder.clear();
+        bulkPaymentIdsHaveEvicted = false;
+    }
+
+    void DatabaseBlockchainCache::flushBulkBatch() const
+    {
+        if (bulkBatchBlocks == 0)
+        {
+            return;
+        }
+
+        /* Taken before the write, so a throw cannot leave the counters claiming
+           blocks that are no longer in the batch. */
+        const uint32_t blocks = bulkBatchBlocks;
+        const bool sync = bulkBatchNeedsSync;
+
+        bulkBatchBlocks = 0;
+        bulkBatchNeedsSync = false;
+
+        const auto res = database.write(bulkBatch, sync);
+
+        /* extractRawDataToInsert moves the vectors out, which leaves them valid
+           but unspecified, so the batch is replaced rather than reused. */
+        bulkBatch = BlockchainWriteBatch();
+
+        if (res)
+        {
+            logger(Logging::ERROR) << "bulk load write of " << blocks << " blocks failed: " << res.message();
+            throw std::runtime_error(res.message());
+        }
+    }
+
+    void DatabaseBlockchainCache::rememberBulkTimestamp(uint64_t timestamp, const std::vector<Crypto::Hash> &blockHashes)
+    {
+        /* Roughly a day of chain time at any sane block target, which is orders
+           of magnitude more slack than a block timestamp is allowed to have
+           against its neighbours. */
+        const size_t BULK_TIMESTAMP_MEMO_ENTRIES = 100000;
+
+        if (bulkTimestamps.emplace(timestamp, blockHashes).second)
+        {
+            bulkTimestampOrder.push_back(timestamp);
+        }
+        else
+        {
+            bulkTimestamps[timestamp] = blockHashes;
+        }
+
+        while (bulkTimestampOrder.size() > BULK_TIMESTAMP_MEMO_ENTRIES)
+        {
+            const uint64_t evicted = bulkTimestampOrder.front();
+            bulkTimestampOrder.pop_front();
+            bulkTimestamps.erase(evicted);
+
+            bulkTimestampsHighestEvicted = std::max(bulkTimestampsHighestEvicted, evicted);
+            bulkTimestampsHaveEvicted = true;
+        }
+    }
+
+    void DatabaseBlockchainCache::rememberBulkPaymentIdCount(const Crypto::Hash &paymentId, uint32_t count)
+    {
+        /* Sized to hold every distinct payment id a real chain has rather than
+           to be small: the moment one is evicted, misses stop being conclusive
+           and each one costs a database read and a batch flush. Two million
+           entries of a 32 byte key and a 4 byte count is on the order of a
+           hundred megabytes, and only if the chain actually has that many - the
+           map grows as it is filled. */
+        const size_t BULK_PAYMENT_ID_MEMO_ENTRIES = 2097152;
+
+        if (bulkPaymentIdCounts.emplace(paymentId, count).second)
+        {
+            bulkPaymentIdOrder.push_back(paymentId);
+        }
+        else
+        {
+            bulkPaymentIdCounts[paymentId] = count;
+        }
+
+        while (bulkPaymentIdOrder.size() > BULK_PAYMENT_ID_MEMO_ENTRIES)
+        {
+            const Crypto::Hash evicted = bulkPaymentIdOrder.front();
+            bulkPaymentIdOrder.pop_front();
+            bulkPaymentIdCounts.erase(evicted);
+
+            if (!bulkPaymentIdsHaveEvicted)
+            {
+                logger(Logging::INFO) << "Bulk load has seen more than " << BULK_PAYMENT_ID_MEMO_ENTRIES
+                                      << " distinct payment ids; falling back to reading their counts from the "
+                                         "database, which will slow the import down.";
+            }
+
+            bulkPaymentIdsHaveEvicted = true;
+        }
     }
 
     void DatabaseBlockchainCache::addGenesisBlock(CachedBlock &&genesisBlock)

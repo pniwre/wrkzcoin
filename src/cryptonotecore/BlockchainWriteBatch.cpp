@@ -8,6 +8,8 @@
 
 #include "DBUtils.h"
 #include <functional>
+#include <iterator>
+#include <utility>
 
 using namespace CryptoNote;
 
@@ -201,6 +203,24 @@ BlockchainWriteBatch &BlockchainWriteBatch::removeKeyOutputInfo(
 {
     rawKeysToRemove.emplace_back(DB::serializeKey(DB::KEY_OUTPUT_KEY_PREFIX, std::make_pair(amount, globalIndex)));
     return *this;
+}
+
+void BlockchainWriteBatch::append(BlockchainWriteBatch &&other)
+{
+    rawDataToInsert.reserve(rawDataToInsert.size() + other.rawDataToInsert.size());
+
+    rawDataToInsert.insert(
+        rawDataToInsert.end(),
+        std::make_move_iterator(other.rawDataToInsert.begin()),
+        std::make_move_iterator(other.rawDataToInsert.end()));
+
+    rawKeysToRemove.insert(
+        rawKeysToRemove.end(),
+        std::make_move_iterator(other.rawKeysToRemove.begin()),
+        std::make_move_iterator(other.rawKeysToRemove.end()));
+
+    other.rawDataToInsert.clear();
+    other.rawKeysToRemove.clear();
 }
 
 std::vector<std::pair<std::string, std::string>> BlockchainWriteBatch::extractRawDataToInsert()

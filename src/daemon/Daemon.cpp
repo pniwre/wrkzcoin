@@ -752,15 +752,16 @@ int main(int argc, char *argv[])
         }
 
         std::string error;
-        std::string filepath = "blockchain.dump";
+        const std::string filepath = config.dumpFile;
 
         auto startTimer = std::chrono::high_resolution_clock::now();
 
-        const bool performExpensiveValidation = false;
+        const bool performExpensiveValidation = config.importValidate;
         auto elapsedTime = std::chrono::high_resolution_clock::now() - startTimer;
         if (config.importChain)
         {
-            logger(INFO) << "Importing blockchain...";
+            logger(INFO) << "Importing blockchain from " << filepath
+                         << (performExpensiveValidation ? " with full validation..." : "...");
             error = ccore->importBlockchain(filepath, performExpensiveValidation);
             elapsedTime = std::chrono::high_resolution_clock::now() - startTimer;
             if (error != "")
@@ -779,7 +780,7 @@ int main(int argc, char *argv[])
             }
         } else if (config.exportChain)
         {
-            logger(INFO) << "Exporting blockchain...";
+            logger(INFO) << "Exporting blockchain to " << filepath << "...";
             error = ccore->exportBlockchain(filepath, config.exportNumBlocks);
             elapsedTime = std::chrono::high_resolution_clock::now() - startTimer;
             if (error != "")
