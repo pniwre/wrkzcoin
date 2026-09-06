@@ -446,13 +446,23 @@ namespace CryptoNote
                 exit(1);
             }
         }
-        context.m_sync_batch_size = m_syncBatchMin;
-        context.m_sync_failures = 0;
-        context.m_sync_orphan_retries = 0;
-        context.m_sync_blocks_per_second = 0.0f;
-        context.m_sync_chunk_start_time = {};
-        context.m_pipelined_objects_outstanding = false;
-        context.m_discard_next_objects_response = false;
+        /* Only a handshake starts a fresh sync relationship. This also runs for
+           every timed sync, once a minute, and those arrive in the middle of a
+           sync - including between a batch we abandoned and the pipelined reply
+           to it that is still in flight. Wiping m_discard_next_objects_response
+           there made that reply look like blocks we never asked for, and the
+           peer was dropped for it. Knocking the adaptive batch size back to the
+           minimum every minute was not intended either. */
+        if (is_initial)
+        {
+            context.m_sync_batch_size = m_syncBatchMin;
+            context.m_sync_failures = 0;
+            context.m_sync_orphan_retries = 0;
+            context.m_sync_blocks_per_second = 0.0f;
+            context.m_sync_chunk_start_time = {};
+            context.m_pipelined_objects_outstanding = false;
+            context.m_discard_next_objects_response = false;
+        }
 
         if (context.m_state == CryptoNoteConnectionContext::state_befor_handshake && !is_initial)
         {
@@ -904,6 +914,36 @@ namespace CryptoNote
 
         if (context.m_requested_objects.size())
         {
+            /* A peer that reorganised, or pruned an alternative chain, between
+               answering our chain request and this one no longer has some of
+               the blocks it listed for us, and says so in missed_ids. That is
+               not misbehaviour - its chain is simply not the one we were told
+               about - so throw the stale list away and ask for the chain
+               again. The blocks it did send go with it; the fresh chain entry
+               lists them again if they still matter. Anything left over that
+               it did not declare missing is a short answer and costs the
+               connection as before. */
+            const bool allDeclaredMissing = std::all_of(
+                context.m_requested_objects.begin(),
+                context.m_requested_objects.end(),
+                [&arg](const Crypto::Hash &hash) {
+                    return std::find(arg.missed_ids.begin(), arg.missed_ids.end(), hash) != arg.missed_ids.end();
+                });
+
+            if (allDeclaredMissing)
+            {
+                logger(Logging::INFO) << context << "Peer no longer has " << context.m_requested_objects.size()
+                                      << " of the blocks it listed for us (reorganised or pruned an alternative "
+                                         "chain), re-requesting chain";
+                context.m_needed_objects.clear();
+                context.m_requested_objects.clear();
+                context.m_state = CryptoNoteConnectionContext::state_synchronizing;
+                NOTIFY_REQUEST_CHAIN::request req {};
+                req.block_ids = m_core.buildSparseChain();
+                post_notify<NOTIFY_REQUEST_CHAIN>(*m_p2p, req, context);
+                return 1;
+            }
+
             onSyncChunkFailure(context);
             logger(Logging::ERROR, Logging::BRIGHT_RED)
                 << context << "returned not all requested objects (context.m_requested_objects.size()="

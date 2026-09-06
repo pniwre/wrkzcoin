@@ -144,9 +144,11 @@ Each of these does its work and exits.
 | --- | --- |
 | `--resync` | Delete the chain and peer state, then sync from scratch. The only option that deletes a chain |
 | `--rewind-to-height <n>` | Roll the local chain back to this height. Must be above `0`; refused below a lite node's height |
-| `--import-blockchain` | Import the database from a dump file |
-| `--export-blockchain` | Export the database to a dump file |
-| `--max-export-blocks <n>` | Cap the blocks included in an export |
+| `--import-blockchain` | Import the database from a dump file. Reads the file, prepares blocks across every core, and writes them in runs; safe to interrupt and re-run, which skips what is already stored |
+| `--import-validate` | Verify every imported block in full - proof of work, ring signatures, the lot. Far slower, for a dump you did not make yourself |
+| `--export-blockchain` | Export the database to a dump file. Refused on a lite node, and on one that has pruned its raw blocks, since neither stores the bodies |
+| `--max-export-blocks <n>` | Cap the blocks included in an export. Larger than the chain exports all of it |
+| `--dump-file <path>` | Where the dump is read from and written to. Defaults to `blockchain.dump` in the working directory |
 | `--load-checkpoints <path\|default>` | CSV checkpoint file, or `default` for the compiled-in checkpoints |
 | `--print-genesis-tx` | Print the genesis transaction and exit |
 | `--version`, `--os-version`, `--help` | Print and exit |

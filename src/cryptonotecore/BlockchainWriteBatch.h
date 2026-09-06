@@ -97,6 +97,17 @@ namespace CryptoNote
         BlockchainWriteBatch &
             removeKeyOutputInfo(IBlockchainCache::Amount amount, IBlockchainCache::GlobalOutputIndex globalIndex);
 
+        /* Moves another batch's writes onto the end of this one and leaves it
+           empty, so several blocks can share a single database write. Order is
+           preserved, which is what makes a later block's value for a key - a
+           running count, the chain's top index - win over an earlier one's.
+
+           Puts and deletes are applied as two groups rather than interleaved,
+           so merging batches where a later one removes what an earlier one
+           wrote would come out wrong. The one caller merges blocks pushed
+           during an import, which only ever insert. */
+        void append(BlockchainWriteBatch &&other);
+
         std::vector<std::pair<std::string, std::string>> extractRawDataToInsert() override;
 
         std::vector<std::string> extractRawKeysToRemove() override;

@@ -71,6 +71,8 @@ namespace DaemonConfig
             snapshotInfo = "";
             exportChain = false;
             exportNumBlocks = 0;
+            importValidate = false;
+            dumpFile = "blockchain.dump";
             prune = false;
             pruneDepth = DEFAULT_PRUNE_DEPTH;
             lite = false;
@@ -194,9 +196,21 @@ namespace DaemonConfig
 
         bool importChain;
 
+        /* Verify every imported block the way a block arriving from a peer is
+           verified - proof of work, ring signatures, the lot. Off by default:
+           a dump is normally something the operator made or was given by
+           someone they trust, and validating turns an import that takes an hour
+           into one that takes as long as syncing would have. */
+        bool importValidate;
+
         bool exportChain;
 
         uint32_t exportNumBlocks;
+
+        /* Where --import-blockchain reads from and --export-blockchain writes
+           to. Relative paths are relative to the working directory, not the
+           data directory - a dump is not part of the database. */
+        std::string dumpFile;
 
         bool prune;
 

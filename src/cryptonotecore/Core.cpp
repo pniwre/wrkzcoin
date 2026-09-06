@@ -8,11 +8,14 @@
 
 #include <WalletTypes.h>
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <common/CryptoNoteTools.h>
 #include <common/FileSystemShim.h>
 #include <common/Math.h>
 #include <common/MemoryInputStream.h>
+#include <common/ScopeExit.h>
 #include <common/ShuffleGenerator.h>
 #include <common/TransactionExtra.h>
 #include <config/Constants.h>
@@ -34,10 +37,14 @@
 #include <cryptonotecore/ValidateTransaction.h>
 #include <cryptonoteprotocol/CryptoNoteProtocolHandlerCommon.h>
 #include <fstream>
+#include <future>
 #include <iomanip>
+#include <memory>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <system/Timer.h>
+#include <thread>
 #include <unordered_set>
 #include <utilities/Container.h>
 #include <utilities/FormatTools.h>
@@ -492,6 +499,14 @@ namespace CryptoNote
         std::vector<RawBlock> &blocks,
         std::vector<Crypto::Hash> &missedHashes) const
     {
+        /* Reads chainsLeaves and walks the chain segments, both of which
+           addBlock mutates under the same mutex. The mining RPC threads add
+           blocks - and switch chains - while the P2P thread is in here, and a
+           hash resolved against the old chain read back the block the new chain
+           put at that height. The peer then received a block it never asked
+           for and dropped us for it. */
+        std::shared_lock lock(m_chainMutex);
+
         throwIfNotInitialized();
 
         /* This serves NOTIFY_REQUEST_GET_OBJECTS, so it is asked for hundreds of
@@ -1329,6 +1344,11 @@ namespace CryptoNote
         std::vector<BinaryArray> &transactions,
         std::vector<Crypto::Hash> &missedHashes) const
     {
+        /* Walks every alternative leaf, which addBlock prunes under this mutex.
+           Reached from the RPC threads for wallets and from the P2P thread for
+           NOTIFY_MISSING_TXS. */
+        std::shared_lock lock(m_chainMutex);
+
         assert(!chainsLeaves.empty());
         assert(!chainsStorage.empty());
         throwIfNotInitialized();
@@ -1413,6 +1433,13 @@ namespace CryptoNote
     {
         assert(!remoteBlockIds.empty());
         assert(remoteBlockIds.back() == getBlockHashByIndex(0));
+
+        /* Serves NOTIFY_REQUEST_CHAIN. The height, the fork point and the hash
+           list below have to come from one chain: a reorg landing between them
+           gives the peer a chain entry it will reject as inconsistent. Same
+           race as getBlocks, same lock. */
+        std::shared_lock lock(m_chainMutex);
+
         throwIfNotInitialized();
 
         totalBlockCount = getTopBlockIndex() + 1;
@@ -2268,6 +2295,14 @@ namespace CryptoNote
         uint64_t &difficulty,
         uint32_t &height)
     {
+        /* Miners poll this from the RPC threads while the P2P thread adds
+           blocks. Height, difficulty and the parent hash are read separately
+           below, and a block arriving in between hands the miner a template
+           that mixes two chains - work that is rejected on submit, or worse,
+           a block that ends up as an alternative. Hold the chain still for
+           the whole build. */
+        std::shared_lock lock(m_chainMutex);
+
         throwIfNotInitialized();
 
         height = getTopBlockIndex() + 1;
@@ -2785,43 +2820,92 @@ namespace CryptoNote
         chainsLeaves[0]->load();
     }
 
+    /* One batch of exported blocks, carrying the height its first block sits at
+       and how many were asked for.
+
+       The writer used to infer heights by counting what it had already written
+       and to treat whatever it was handed as complete. Both assumptions break
+       on a lite node and on a node that has pruned raw blocks: the database has
+       no block body to return down there, so the batch comes back short or
+       empty. Short mislabels every block after it, and empty leaves the writer
+       waiting on a queue the producer has already finished filling - an export
+       that never returns. Saying what was asked for lets the writer notice. */
+    struct ExportedBlockBatch
+    {
+        uint64_t startHeight = 0;
+
+        uint64_t expectedCount = 0;
+
+        std::vector<RawBlock> blocks;
+    };
+
     void writeBlockchain(
-        ThreadSafeQueue<std::future<std::vector<RawBlock>>> &blockQueue,
+        ThreadSafeQueue<std::future<ExportedBlockBatch>> &blockQueue,
         std::fstream &blockchainDump,
         const uint64_t startIndex,
-        const uint64_t endIndex)
+        const uint64_t endIndex,
+        std::atomic<bool> &failed,
+        std::string &failureReason)
     {
         uint64_t height = startIndex;
 
-        while (true)
+        /* Reused rather than rebuilt per block: an export writes millions of
+           these and the block body is the only part that changes size. */
+        std::string line;
+
+        const auto fail = [&](const std::string &reason) {
+            failureReason = reason;
+            failed = true;
+            blockchainDump.close();
+        };
+
+        while (height < endIndex)
         {
             /* Loop through promises */
-            for (auto &block : blockQueue.pop().get())
+            const ExportedBlockBatch batch = blockQueue.pop().get();
+
+            for (size_t i = 0; i < batch.blocks.size(); i++)
             {
-                const auto blockBinary = toBinaryArray(block);
-                const std::string blockBinaryStr = std::string(blockBinary.begin(), blockBinary.end());
+                height = batch.startHeight + i;
+
+                const auto blockBinary = toBinaryArray(batch.blocks[i]);
 
                 /* Height - Size of following block - Block */
-                const std::string line = std::to_string(height) + " " + std::to_string(blockBinaryStr.size()) + " " + blockBinaryStr + " ";
+                line.assign(std::to_string(height));
+                line += ' ';
+                line += std::to_string(blockBinary.size());
+                line += ' ';
+                line.append(reinterpret_cast<const char *>(blockBinary.data()), blockBinary.size());
+                line += ' ';
 
-                if (!line.empty() && line != " ")
+                blockchainDump.write(line.c_str(), line.size());
+
+                /* A dump that silently stopped short of the disk is worse than
+                   no dump: it imports cleanly right up to the truncation. */
+                if (!blockchainDump)
                 {
-                    blockchainDump.write(line.c_str(), line.size());
-                    height++;
-                } else
-                {
-                    blockchainDump.close();
+                    fail(
+                        "Failed writing block " + std::to_string(height) + " to the dump file: "
+                        + std::string(strerror(errno)));
+
                     return;
                 }
             }
 
-            /* All blocks exported. */
-            if (height == endIndex)
+            height = batch.startHeight + batch.blocks.size();
+
+            if (batch.blocks.size() != batch.expectedCount)
             {
-                blockchainDump.close();
+                fail(
+                    "No block body is stored at height " + std::to_string(height)
+                    + ". A lite node, or a node that has pruned its raw blocks, cannot export the region it did "
+                      "not keep - export from a node holding the whole chain, or start above that height.");
+
                 return;
             }
-        }        
+        }
+
+        blockchainDump.close();
     }
 
     /* Note: Final block height will be endIndex - 1 */
@@ -2841,18 +2925,48 @@ namespace CryptoNote
 
         uint64_t endIndex = currentIndex;
 
-        if (numBlocks > 0 && numBlocks <= endIndex)
+        /* --max-export-blocks is a ceiling, so asking for more blocks than the
+           chain has means "all of them" rather than an error. Refusing was only
+           ever an obstacle: the operator does not know the top height in
+           advance, and the request is unambiguous. */
+        if (numBlocks > 0 && numBlocks < endIndex)
         {
             endIndex = numBlocks;
-        } else if (numBlocks > endIndex)
-        {
-            return "Out of range. endIndex only: " + std::to_string(endIndex);
         }
+        else if (numBlocks > endIndex)
+        {
+            std::cout << "Chain is only " << endIndex << " blocks tall, exporting all of it rather than the "
+                      << numBlocks << " asked for." << std::endl;
+        }
+
         uint64_t startIndex = 1;
 
         if (endIndex < 1000 || endIndex > CryptoNote::parameters::CRYPTONOTE_MAX_BLOCK_NUMBER)
         {
             return "Top block is too low or too high, not going to create an export. endIndex: " + std::to_string(endIndex);
+        }
+
+        /* A lite node keeps no block bodies below its lite height, so it has
+           nothing to write down there. Caught here rather than several million
+           blocks into the export, where it surfaces as a batch that came back
+           empty. */
+        if (const auto dbCache = dynamic_cast<DatabaseBlockchainCache *>(mainChain))
+        {
+            const uint32_t liteHeight = dbCache->getLiteHeight();
+
+            if (liteHeight > startIndex)
+            {
+                return "This is a lite node: it stores no block bodies below height " + std::to_string(liteHeight)
+                    + ", so it cannot export them. Export from a node holding the whole chain.";
+            }
+        }
+
+        /* Pruning records no height it pruned to, so the only way to know is to
+           ask for the first block the export needs. */
+        if (mainChain->getBlocksByHeight(startIndex, startIndex + 1).empty())
+        {
+            return "No block body is stored at height " + std::to_string(startIndex)
+                + ", so there is nothing to export. A node that has pruned its raw blocks cannot produce a dump.";
         }
 
         std::fstream blockchainDump(filePath, std::ios::out | std::ios_base::binary);
@@ -2873,20 +2987,35 @@ namespace CryptoNote
         const uint64_t batchSizePerThread = 1000;
         const uint64_t batchSizePerLoop = batchSizePerThread * threadCount;
 
-        Utilities::ThreadPool<std::vector<RawBlock>> threadPool(threadCount);
+        Utilities::ThreadPool<ExportedBlockBatch> threadPool(threadCount);
 
-        ThreadSafeQueue<std::future<std::vector<RawBlock>>> pendingBlocks;
+        ThreadSafeQueue<std::future<ExportedBlockBatch>> pendingBlocks;
 
-        std::thread writeThread(writeBlockchain, std::ref(pendingBlocks), std::ref(blockchainDump), startIndex, endIndex);
+        /* Set by the writer when it gives up, so the producer below stops
+           feeding a queue nobody is draining any more. Without it a writer that
+           returned early leaves the producer sleeping on a throttle condition
+           that can no longer become false. */
+        std::atomic<bool> failed(false);
 
-        for (uint64_t index = startIndex; index < endIndex; index += batchSizePerLoop)
+        std::string failureReason;
+
+        std::thread writeThread(
+            writeBlockchain,
+            std::ref(pendingBlocks),
+            std::ref(blockchainDump),
+            startIndex,
+            endIndex,
+            std::ref(failed),
+            std::ref(failureReason));
+
+        for (uint64_t index = startIndex; index < endIndex && !failed; index += batchSizePerLoop)
         {
-            while (pendingBlocks.size() > threadCount)
+            while (pendingBlocks.size() > threadCount && !failed)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
 
-            for (uint64_t threadNum = 0; threadNum < threadCount; threadNum++)
+            for (uint64_t threadNum = 0; threadNum < threadCount && !failed; threadNum++)
             {
                 const uint64_t batchStart = index + (batchSizePerThread * threadNum);
 
@@ -2902,107 +3031,328 @@ namespace CryptoNote
                  * args we capture by value, not reference here, or the batches
                  * will get all messed up. */
                 pendingBlocks.pushMove(std::move(threadPool.addJob([batchStart, batchEnd, &mainChain] {
-                    return mainChain->getBlocksByHeight(batchStart, batchEnd);
+                    ExportedBlockBatch batch;
+                    batch.startHeight = batchStart;
+                    batch.expectedCount = batchEnd - batchStart;
+                    batch.blocks = mainChain->getBlocksByHeight(batchStart, batchEnd);
+
+                    return batch;
                 })));
             }
 
             auto time = std::time(nullptr);
 
-            std::cout << "Progress [" << index << " / " << endIndex << "]" 
-                      << " @ Time [" << std::put_time(std::localtime(&time), "%H:%M:%S") 
+            std::cout << "Progress [" << index << " / " << endIndex << "]"
+                      << " @ Time [" << std::put_time(std::localtime(&time), "%H:%M:%S")
                       << "]" << std::endl;
         }
 
+        /* The writer stops on its own once it has written endIndex - startIndex
+           blocks, or the moment it fails. Nothing else has to wake it: it is
+           only ever blocked on a queue this loop has already finished filling. */
         writeThread.join();
+
+        if (failed)
+        {
+            /* The dump on disk stops mid chain, so leaving it would hand the
+               operator a file that imports cleanly and silently ends early. */
+            std::error_code ignored;
+            fs::remove(dumpfile, ignored);
+
+            return failureReason;
+        }
 
         auto time_end = std::time(nullptr);
 
-        std::cout << "Progress [" << endIndex << " / " << endIndex << "]" 
-                  << " @ Time [" << std::put_time(std::localtime(&time_end), "%H:%M:%S") 
+        std::cout << "Progress [" << endIndex << " / " << endIndex << "]"
+                  << " @ Time [" << std::put_time(std::localtime(&time_end), "%H:%M:%S")
                   << "]" << std::endl;
 
         return std::string();
     }
 
-    std::tuple<uint64_t, RawBlock, std::string> readRawBlock(std::ifstream &blockchainDump, uint64_t prevBlockHeight)
+    namespace
     {
-        std::string blockIndexStr;
-        std::string rawBlockLenStr;
+        /* How many blocks one parse job covers. Small enough that the pipeline
+           fills quickly and no worker sits on a long tail, large enough that
+           the job hand off is lost in the work. */
+        const size_t IMPORT_BLOCKS_PER_PARSE_JOB = 32;
 
-        /* Read in the block height and the length of the following raw block */
-        blockchainDump >> blockIndexStr >> rawBlockLenStr;
+        /* How many prepared blocks share one database write. A block's writes
+           are a few dozen kilobytes, and the fixed cost of a write - the write
+           ahead log append, the group commit machinery - is what this amortises.
+           Every batch is still atomic, so a killed import loses whole trailing
+           blocks and never half of one. */
+        const uint32_t IMPORT_BLOCKS_PER_DATABASE_WRITE = 100;
 
-        if (blockIndexStr.empty() || blockIndexStr == " " || rawBlockLenStr.empty() || rawBlockLenStr == " ")
+        /* The dump is read with formatted extraction and small reads, so the
+           stream buffer decides how often that reaches the disk. The default is
+           a few kilobytes against a file measured in gigabytes. */
+        const size_t IMPORT_READ_BUFFER_BYTES = 8 * 1024 * 1024;
+
+        /* One block as it comes off the dump: a height and a run of bytes, with
+           nothing deserialised yet. */
+        struct RawImportRecord
         {
-            return { 0, RawBlock(), "Empty blockIndexStr or rawBlockLenStr" };
-        }
+            uint64_t height = 0;
 
-        try
+            BinaryArray bytes;
+        };
+
+        /* Everything about one block that follows from its own bytes, which is
+           every part of importing it that does not depend on the blocks around
+           it - and, on a transaction heavy chain, most of the cost. Prepared on
+           a worker thread so the serial push has only the chain dependent work
+           left: the difficulty, the emission, and the database write.
+
+           These are passed around by unique_ptr and never copied or moved after
+           construction, because CachedBlock holds a reference to a BlockTemplate
+           and the one it references is the member below. */
+        struct PreparedBlock
         {
-            uint64_t blockIndex = std::stoull(blockIndexStr);
-            uint64_t rawBlockLen = std::stoull(rawBlockLenStr);
-
-            /* Verify block height is previous height + 1. If importing
-             * initial block, we don't know the previous block height, so don't
-             * verify this. */
-            if (blockIndex != prevBlockHeight + 1 && prevBlockHeight != 0)
-            {
-                std::stringstream stream;
-
-                stream << "Blockchain import file is invalid, found block "
-                       << "height of " << blockIndex << " after previous block "
-                       << "height of " << prevBlockHeight;
-
-                return { 0, RawBlock(), stream.str() };
-            }
-
-            /* Allocate space for us to read in the raw block */
-            std::string rawBlockStr;
-            rawBlockStr.resize(rawBlockLen);
-
-            /* Advance stream by one char to skip space character */
-            blockchainDump.ignore();
-
-            /* Read raw block */
-            if (!blockchainDump.read(rawBlockStr.data(), rawBlockLen))
-            {
-                std::stringstream stream;
-
-                stream << "Blockchain import file is invalid, rawBlockLen "
-                       << "exceeds end of file while parsing block with height "
-                       << blockIndex << ". Error: " << strerror(errno) << ", rawBlockLen: " << rawBlockLen;
-
-                return { 0, RawBlock(), stream.str() };
-            }
+            uint64_t height = 0;
 
             RawBlock rawBlock;
 
-            /* Parse raw block */
-            if (!fromBinaryArray(rawBlock, std::vector<uint8_t>(rawBlockStr.begin(), rawBlockStr.end())))
+            BlockTemplate blockTemplate;
+
+            std::optional<CachedBlock> cachedBlock;
+
+            std::vector<CachedTransaction> transactions;
+
+            TransactionValidatorState spentOutputs;
+
+            uint64_t cumulativeSize = 0;
+
+            uint64_t cumulativeFee = 0;
+
+            /* Empty unless this block could not be parsed. Carried rather than
+               thrown so the failure arrives at the consumer in chain order,
+               naming the first bad block rather than whichever worker noticed
+               something first. */
+            std::string error;
+        };
+
+        struct ImportBatch
+        {
+            std::vector<std::unique_ptr<PreparedBlock>> blocks;
+
+            /* The reader pushes one of these when it runs out of file, so the
+               consumer stops rather than blocking on a queue nothing will push
+               to again. Carries the reader's error, if it had one. */
+            bool endOfStream = false;
+
+            std::string error;
+        };
+
+        std::unique_ptr<PreparedBlock> prepareBlock(RawImportRecord &&record, const uint64_t maxTxSize)
+        {
+            auto prepared = std::make_unique<PreparedBlock>();
+
+            prepared->height = record.height;
+
+            try
             {
-                std::stringstream stream;
+                if (!fromBinaryArray(prepared->rawBlock, record.bytes))
+                {
+                    prepared->error = "Blockchain import file is invalid, cannot parse the raw block at height "
+                        + std::to_string(record.height);
 
-                stream << "[!rawBlock] Blockchain import file is invalid, cannot parse "
-                       << "rawBlock at height " << blockIndex;
+                    return prepared;
+                }
 
-                return { 0, RawBlock(), stream.str() };
+                /* The bytes are in rawBlock now; let the reader's buffer go. */
+                record.bytes.clear();
+                record.bytes.shrink_to_fit();
+
+                if (!fromBinaryArray(prepared->blockTemplate, prepared->rawBlock.block))
+                {
+                    prepared->error = "Blockchain import file is invalid, cannot parse the block header at height "
+                        + std::to_string(record.height);
+
+                    return prepared;
+                }
+
+                prepared->cachedBlock.emplace(prepared->blockTemplate);
+
+                /* Memoised on first use, and the consumer needs it twice - to
+                   chain onto the previous block and to store the block. Forced
+                   here so that hashing happens on this thread. */
+                prepared->cachedBlock->getBlockHash();
+
+                prepared->transactions.reserve(prepared->rawBlock.transactions.size());
+
+                for (const auto &rawTransaction : prepared->rawBlock.transactions)
+                {
+                    if (rawTransaction.size() > maxTxSize)
+                    {
+                        prepared->error = "Blockchain import file is invalid, the transaction of "
+                            + std::to_string(rawTransaction.size()) + " bytes in the block at height "
+                            + std::to_string(record.height) + " is larger than a transaction may be";
+
+                        return prepared;
+                    }
+
+                    prepared->cumulativeSize += rawTransaction.size();
+
+                    /* Deserialises the transaction, ring signatures included,
+                       which is the single largest piece of per block work an
+                       import does. */
+                    prepared->transactions.emplace_back(rawTransaction);
+                }
+
+                for (const auto &transaction : prepared->transactions)
+                {
+                    /* Both memoised, and both read during the push. */
+                    transaction.getTransactionHash();
+
+                    prepared->cumulativeFee += transaction.getTransactionFee();
+                }
+
+                prepared->spentOutputs = extractSpentOutputs(prepared->transactions);
+
+                /* Append cumulative size of the block itself */
+                prepared->cumulativeSize += getObjectBinarySize(prepared->blockTemplate.baseTransaction);
+            }
+            catch (const std::exception &e)
+            {
+                prepared->error = "Blockchain import file is invalid, the block at height "
+                    + std::to_string(record.height) + " could not be read: " + e.what();
             }
 
-            /* Advance stream by one char to skip space character */
-            blockchainDump.ignore();
-
-            return { blockIndex, rawBlock, std::string() };
+            return prepared;
         }
-        catch (const std::exception &e)
+
+        /* Reads the next record out of the dump.
+
+           The format is a flat run of "<height> <length> <length bytes> ", so
+           every record boundary can be found without deserialising anything -
+           which is what lets the parsing move off the reading thread, and what
+           lets a resume step over the blocks the database already has at the
+           speed of a seek.
+
+           Returns false at the end of the file and on a malformed record; the
+           two are told apart by whether error was set. */
+        bool readImportRecord(
+            std::ifstream &dump,
+            const std::streamoff dumpSize,
+            const uint64_t highestStoredHeight,
+            RawImportRecord &record,
+            bool &alreadyStored,
+            std::string &error)
         {
-            std::stringstream stream;
+            std::string heightText;
+            std::string lengthText;
 
-            stream << "[exception] Blockchain import file is invalid, cannot parse block "
-                   << "index at height " << prevBlockHeight + 1 << " " << e.what() << "blockIndexStr: " << blockIndexStr << " rawBlockLenStr: " << rawBlockLenStr;
+            /* Skips the separating whitespace itself, so a clean end of file
+               shows up here and nowhere else. */
+            if (!(dump >> heightText >> lengthText))
+            {
+                return false;
+            }
 
-            return { 0, RawBlock(), stream.str() };
+            uint64_t length = 0;
+
+            try
+            {
+                record.height = std::stoull(heightText);
+                length = std::stoull(lengthText);
+            }
+            catch (const std::exception &e)
+            {
+                error = "Blockchain import file is invalid, could not read a block header - got \"" + heightText
+                    + "\" and \"" + lengthText + "\": " + e.what();
+
+                return false;
+            }
+
+            /* A corrupt length would otherwise be believed all the way into an
+               allocation the size of whatever the bytes happened to say. */
+            if (length == 0 || length > CryptoNote::parameters::CRYPTONOTE_MAX_BLOCK_BLOB_SIZE)
+            {
+                error = "Blockchain import file is invalid, the block at height " + std::to_string(record.height)
+                    + " claims to be " + std::to_string(length) + " bytes";
+
+                return false;
+            }
+
+            /* Step over the single space between the length and the block. */
+            dump.ignore();
+
+            alreadyStored = record.height <= highestStoredHeight;
+
+            if (alreadyStored)
+            {
+                /* Nothing will look at these bytes, so they are never read.
+                   Reading and deserialising them only to throw them away is
+                   what used to make resuming an import nearly as expensive as
+                   starting one.
+
+                   Stepped over inside the stream's own buffer whenever the
+                   block fits in what is already there, which for an ordinary
+                   block against a buffer this size is always. Seeking would
+                   discard the whole buffer and refill it for the next few
+                   hundred bytes, turning a cheap skip into megabytes of reading
+                   per block - far worse than what it replaced. */
+                if (static_cast<std::streamsize>(length) <= dump.rdbuf()->in_avail())
+                {
+                    dump.ignore(static_cast<std::streamsize>(length));
+
+                    /* in_avail promised the characters were there, so this is
+                       belt and braces - but ignore reports a short run only by
+                       setting eofbit, which leaves the stream testing as good,
+                       so the usual check below would not see it. */
+                    if (dump.gcount() != static_cast<std::streamsize>(length))
+                    {
+                        error = "Blockchain import file is invalid, it ends inside the block at height "
+                            + std::to_string(record.height);
+
+                        return false;
+                    }
+                }
+                else
+                {
+                    /* Only reached for a block larger than the buffer holds, by
+                       which point there is little left in it to lose.
+
+                       Bounded against the file's length rather than left to the
+                       seek, because seeking past the end is not itself an error
+                       - a truncated dump would look like a clean end of file
+                       and the import would report success at the wrong height.
+                       The buffered branch above settles the same question by
+                       counting what ignore actually stepped over. */
+                    const std::streamoff position = dump.tellg();
+
+                    if (position < 0 || dumpSize - position < static_cast<std::streamoff>(length))
+                    {
+                        error = "Blockchain import file is invalid, it ends inside the block at height "
+                            + std::to_string(record.height);
+
+                        return false;
+                    }
+
+                    dump.seekg(static_cast<std::streamoff>(length), std::ios::cur);
+                }
+            }
+            else
+            {
+                record.bytes.resize(length);
+
+                dump.read(reinterpret_cast<char *>(record.bytes.data()), static_cast<std::streamsize>(length));
+            }
+
+            if (!dump)
+            {
+                error = "Blockchain import file is invalid, it ends inside the block at height "
+                    + std::to_string(record.height);
+
+                return false;
+            }
+
+            return true;
         }
-    }
+
+    } // namespace
 
     std::tuple<Crypto::Hash, std::string> Core::importRawBlock(
         RawBlock &rawBlock,
@@ -3090,119 +3440,374 @@ namespace CryptoNote
     {
         IBlockchainCache *mainChain = chainsLeaves[0];
 
-        uint64_t currentIndex = chainsLeaves[0]->getTopBlockIndex() + 1;
+        const uint32_t dbTopIndex = mainChain->getTopBlockIndex();
 
-        std::cout << "Existing DB has currentIndex: " << currentIndex << std::endl;
+        std::cout << "Existing DB has currentIndex: " << (static_cast<uint64_t>(dbTopIndex) + 1) << std::endl;
 
-        std::ifstream blockchainDump(filePath, std::ios::in | std::ios_base::binary);
+        /* Handed to the stream before it is opened, which is the only point at
+           which it will adopt one. The default buffer is a few kilobytes and
+           this file is measured in gigabytes. */
+        std::vector<char> readBuffer(IMPORT_READ_BUFFER_BYTES);
+
+        std::ifstream blockchainDump;
+
+        blockchainDump.rdbuf()->pubsetbuf(readBuffer.data(), static_cast<std::streamsize>(readBuffer.size()));
+
+        blockchainDump.open(filePath, std::ios::in | std::ios_base::binary);
 
         if (!blockchainDump)
         {
             return "Failed to open filepath specified: " + std::string(strerror(errno));
         }
 
-        RawBlock rawBlock;
-        uint64_t startHeight;
-        std::string err;
-        Crypto::Hash previousBlockHash;
+        /* Taken once, so that stepping over a block can tell "the file ends
+           here" from "seek accepted a position past the end". */
+        blockchainDump.seekg(0, std::ios::end);
 
-        /* Read in first block to figure out start height */
-        std::tie(startHeight, rawBlock, err) = readRawBlock(blockchainDump, 0);
+        const std::streamoff dumpSize = blockchainDump.tellg();
 
-        if (err != "")
+        blockchainDump.seekg(0, std::ios::beg);
+
+        if (dumpSize <= 0)
         {
-            return err;
+            return "Blockchain import file " + filePath + " is empty.";
         }
 
-        /* Blockchain import file starts at a greater height than our database.
-         * Cannot import if there are gaps in the chain. */
-        if (startHeight > currentIndex && currentIndex != 1)
+        /* The hash the next imported block has to name as its parent.
+
+           Taken from the database rather than picked up from the blocks skipped
+           on the way in, so a resume where the dump starts exactly where the
+           database stops - and therefore skips nothing - still begins from the
+           right place. That case used to compare against an uninitialised hash
+           and fail with a message about a mismatched parent. */
+        Crypto::Hash previousBlockHash = mainChain->getBlockHash(dbTopIndex);
+
+        /* Importing is three jobs that can run at once: reading the file,
+           turning bytes into blocks, and pushing them onto the chain. Only the
+           last is inherently serial - every block's difficulty and emission
+           come from the blocks before it - and on a transaction heavy chain it
+           is not the largest. So the file is read on one thread, blocks are
+           prepared on a pool, and this thread does nothing but push them in
+           order. It is the shape the export has always had, inverted. */
+        uint64_t threadCount = std::thread::hardware_concurrency();
+
+        /* Could not detect thread count */
+        if (threadCount == 0)
         {
-            return "Blockchain import file starts at block height of " + std::to_string(startHeight)
-                + ", while database is at block height of " + std::to_string(currentIndex)
-                + ". Cannot import until database is at same height or higher than blockchain import file.";
+            threadCount = 1;
         }
 
-        uint64_t blockHeight = startHeight;
-
-        /* Import the first block, if from empty database */
-        if (currentIndex == 1)
+        /* One core is left for this thread, which has the serial half. */
+        if (threadCount > 2)
         {
-            std::tie(previousBlockHash, err) = importRawBlock(rawBlock, getBlockHashByIndex(blockHeight - 1), blockHeight, true);
+            threadCount--;
         }
 
-        if (err != "")
+        const auto dbCache = dynamic_cast<DatabaseBlockchainCache *>(mainChain);
+
+        /* Validation goes through addBlock, which reads and writes the chain by
+           paths of its own; the buffered writes a bulk load uses are only meant
+           for the direct push below. */
+        const bool bulkLoad = dbCache != nullptr && !performExpensiveValidation;
+
+        if (bulkLoad)
         {
-            return err;
+            dbCache->beginBulkLoad(IMPORT_BLOCKS_PER_DATABASE_WRITE);
         }
 
-        /* Read rest of blocks line by line. */
-        uint64_t topHeight = startHeight;
+        /* Only the error paths below rely on this. The success path closes the
+           bulk load itself, so that a failure to write the final batch is
+           reported instead of swallowed here - a destructor may not throw, and
+           this one can run during stack unwinding. */
+        Tools::ScopeExit closeBulkLoad([dbCache, bulkLoad]() {
+            if (!bulkLoad)
+            {
+                return;
+            }
 
-        while (blockchainDump)
-        {
-            /* Read block */
-            try {
-                std::tie(blockHeight, rawBlock, err) = readRawBlock(blockchainDump, blockHeight);
-                if ((blockHeight <= currentIndex - 1) && currentIndex != 1)
+            try
+            {
+                dbCache->endBulkLoad();
+            }
+            catch (const std::exception &)
+            {
+            }
+        });
+
+        Utilities::ThreadPool<ImportBatch> threadPool(threadCount);
+
+        ThreadSafeQueue<std::future<ImportBatch>> pendingBlocks;
+
+        std::atomic<bool> abort(false);
+
+        const uint64_t maxTxSize = currency.maxTxSize();
+
+        std::atomic<uint64_t> skippedBlocks(0);
+
+        std::thread readThread([&]() {
+            std::string readError;
+
+            std::vector<RawImportRecord> batch;
+            batch.reserve(IMPORT_BLOCKS_PER_PARSE_JOB);
+
+            const auto submit = [&]() {
+                if (batch.empty())
                 {
-                    previousBlockHash = chainsLeaves[0]->getBlockHash(blockHeight);;
+                    return;
+                }
 
-                    ++topHeight;
+                /* Shared rather than moved into the job: ThreadPool takes a
+                   std::function, which has to be copyable, and a moved in
+                   vector would make the lambda move only. */
+                auto records = std::make_shared<std::vector<RawImportRecord>>(std::move(batch));
 
-                    if (blockHeight > 1 && (blockHeight +1) % 1000 == 0 
-                    && err != "Empty blockIndexStr or rawBlockLenStr")
+                batch.clear();
+                batch.reserve(IMPORT_BLOCKS_PER_PARSE_JOB);
+
+                pendingBlocks.pushMove(std::move(threadPool.addJob([records, maxTxSize]() {
+                    ImportBatch prepared;
+                    prepared.blocks.reserve(records->size());
+
+                    for (auto &record : *records)
                     {
-                        std::cout << "Skipped block " << (blockHeight) << " previousBlockHash: " << previousBlockHash 
-                                  << std::endl;
+                        prepared.blocks.push_back(prepareBlock(std::move(record), maxTxSize));
                     }
 
-                    continue;
-                }
-            } catch (const std::exception &e)
+                    return prepared;
+                })));
+            };
+
+            try
             {
-                break;
-                return err;
-            }
-
-            if (err != "" && err != "Empty blockIndexStr or rawBlockLenStr")
-            {
-                return err;
-            }
-
-            if (err == "Empty blockIndexStr or rawBlockLenStr")
-            {
-                std::cout << "Completed at block " << (topHeight + 1) << std::endl;
-
-                return std::string();
-            }
-
-            if (performExpensiveValidation)
-            {
-                const auto errorCode = addBlock(std::move(rawBlock));
-
-                if (errorCode)
+                while (!abort)
                 {
-                    return "Blockchain import file is invalid, " + errorCode.message();
+                    RawImportRecord record;
+                    bool alreadyStored = false;
+
+                    if (!readImportRecord(
+                            blockchainDump, dumpSize, dbTopIndex, record, alreadyStored, readError))
+                    {
+                        break;
+                    }
+
+                    if (alreadyStored)
+                    {
+                        skippedBlocks++;
+
+                        continue;
+                    }
+
+                    batch.push_back(std::move(record));
+
+                    if (batch.size() >= IMPORT_BLOCKS_PER_PARSE_JOB)
+                    {
+                        submit();
+
+                        /* Bounds how much of the file is in flight at once, in
+                           prepared form, which is several times the size of the
+                           bytes it came from. */
+                        while (pendingBlocks.size() > threadCount * 2 && !abort)
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        }
+                    }
                 }
+
+                /* The tail, which is almost never a full job's worth. */
+                submit();
             }
-            else
+            catch (const std::exception &e)
             {
-                /* Add block to chain */
-                std::tie(previousBlockHash, err) = importRawBlock(rawBlock, previousBlockHash, blockHeight, false);
-
-                if (err != "")
-                {
-                    return err;
-                }
+                readError = "Blockchain import failed while reading the dump file: " + std::string(e.what());
             }
-            ++topHeight;
-        }
 
-        if (!blockchainDump.eof())
+            /* Pushed on every path out, or the consumer waits forever. */
+            ImportBatch terminal;
+            terminal.endOfStream = true;
+            terminal.error = readError;
+
+            std::promise<ImportBatch> terminalPromise;
+            terminalPromise.set_value(std::move(terminal));
+
+            pendingBlocks.pushMove(terminalPromise.get_future());
+        });
+
+        Tools::ScopeExit joinReader([&]() {
+            abort = true;
+
+            if (readThread.joinable())
+            {
+                readThread.join();
+            }
+        });
+
+        std::string error;
+
+        uint64_t importedBlocks = 0;
+        uint64_t topHeight = dbTopIndex;
+
+        /* Where the time actually goes. Waiting means the pipeline is starved
+           and preparing blocks is the limit; pushing means the database is.
+           Reported at the end, so a slow import can be diagnosed without
+           attaching a profiler to it. */
+        std::chrono::nanoseconds waitTime(0);
+        std::chrono::nanoseconds pushTime(0);
+
+        const auto startTime = std::chrono::steady_clock::now();
+
+        while (error.empty())
         {
-            return "Blockchain import failed, failed to read from file but file has more data to be read.";
+            const auto waitStart = std::chrono::steady_clock::now();
+
+            ImportBatch batch = pendingBlocks.pop().get();
+
+            waitTime += std::chrono::steady_clock::now() - waitStart;
+
+            if (batch.endOfStream)
+            {
+                error = batch.error;
+
+                break;
+            }
+
+            const auto pushStart = std::chrono::steady_clock::now();
+
+            for (auto &prepared : batch.blocks)
+            {
+                if (!prepared->error.empty())
+                {
+                    error = prepared->error;
+
+                    break;
+                }
+
+                if (prepared->height != topHeight + 1)
+                {
+                    error = "Blockchain import file is invalid, found block height of "
+                        + std::to_string(prepared->height) + " after previous block height of "
+                        + std::to_string(topHeight);
+
+                    break;
+                }
+
+                if (prepared->blockTemplate.previousBlockHash != previousBlockHash)
+                {
+                    error = "Blockchain import file is invalid, the previous block hash of the block at height "
+                        + std::to_string(prepared->height) + " does not match the hash of the block at height "
+                        + std::to_string(prepared->height - 1);
+
+                    break;
+                }
+
+                try
+                {
+                    if (performExpensiveValidation)
+                    {
+                        const auto errorCode = addBlock(std::move(prepared->rawBlock));
+
+                        if (errorCode)
+                        {
+                            error = "Blockchain import file is invalid at height " + std::to_string(prepared->height)
+                                + ", " + errorCode.message();
+
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        /* Everything the block decides on its own was worked out
+                           on a worker thread. What is left is what depends on
+                           the chain underneath it. */
+                        const uint64_t currentDifficulty =
+                            chainsLeaves[0]->getDifficultyForNextBlock(static_cast<uint32_t>(prepared->height - 1));
+
+                        const int64_t emissionChange = getEmissionChange(
+                            currency,
+                            *chainsLeaves[0],
+                            static_cast<uint32_t>(prepared->height - 1),
+                            *prepared->cachedBlock,
+                            prepared->cumulativeSize,
+                            prepared->cumulativeFee);
+
+                        chainsLeaves[0]->pushBlock(
+                            *prepared->cachedBlock,
+                            prepared->transactions,
+                            prepared->spentOutputs,
+                            prepared->cumulativeSize,
+                            emissionChange,
+                            currentDifficulty,
+                            std::move(prepared->rawBlock));
+                    }
+                }
+                catch (const std::exception &e)
+                {
+                    error = "Failed to import the block at height " + std::to_string(prepared->height) + ": "
+                        + std::string(e.what());
+
+                    break;
+                }
+
+                previousBlockHash = prepared->cachedBlock->getBlockHash();
+                topHeight = prepared->height;
+                importedBlocks++;
+
+                if (topHeight % 10000 == 0)
+                {
+                    auto time = std::time(nullptr);
+
+                    std::cout << "Importing block [" << topHeight << "]"
+                              << " @ Time [" << std::put_time(std::localtime(&time), "%H:%M:%S") << "]" << std::endl;
+                }
+            }
+
+            pushTime += std::chrono::steady_clock::now() - pushStart;
         }
+
+        /* The reader is either finished or sitting in its throttle; either way
+           it stops as soon as it sees this. Joined here rather than left to the
+           scope guard so that nothing below runs beside it. */
+        abort = true;
+        readThread.join();
+        joinReader.cancel();
+
+        if (bulkLoad)
+        {
+            /* The tail is flushed whether or not the import got all the way
+               through: the blocks in it are whole and valid, and writing them
+               is what lets a later run resume from there rather than redo them. */
+            closeBulkLoad.cancel();
+
+            try
+            {
+                dbCache->endBulkLoad();
+            }
+            catch (const std::exception &e)
+            {
+                return error.empty() ? "Blockchain import failed writing the last blocks: " + std::string(e.what())
+                                     : error;
+            }
+        }
+
+        if (!error.empty())
+        {
+            return error;
+        }
+
+        const auto elapsed = std::chrono::steady_clock::now() - startTime;
+
+        std::cout << "Imported " << importedBlocks << " blocks";
+
+        if (skippedBlocks.load() > 0)
+        {
+            std::cout << ", skipped " << skippedBlocks.load() << " the database already had";
+        }
+
+        std::cout << ". Completed at block " << topHeight << "." << std::endl;
+
+        std::cout << "Spent " << std::chrono::duration_cast<std::chrono::seconds>(pushTime).count()
+                  << "s pushing blocks and " << std::chrono::duration_cast<std::chrono::seconds>(waitTime).count()
+                  << "s waiting for blocks to be prepared, out of "
+                  << std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() << "s." << std::endl;
 
         return std::string();
     }

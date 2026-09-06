@@ -32,6 +32,7 @@
 #include <functional>
 #include <optional>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 namespace CryptoNote
@@ -288,6 +289,14 @@ namespace CryptoNote
 
         size_t pruneStoredRawBlocks(uint32_t pruneDepth);
 
+        /* Height at and above which whole blocks are stored. Zero on a node that
+           stores everything. Anything that needs block bodies over a range - the
+           blockchain export, most obviously - has to know where they start. */
+        uint32_t getLiteHeight() const
+        {
+            return liteHeight;
+        }
+
         /* Per table record counts and on disk byte totals, measured by walking the
            database. Used to size a lite node snapshot before committing to a
            format: the block info section is the one component whose size is known
@@ -324,6 +333,30 @@ namespace CryptoNote
 
         std::pair<std::error_code, std::string> compactDatabaseDetailed(bool rewriteBottommost = false);
 
+        /* Bulk load mode, for --import-blockchain and nothing else.
+
+           Two things change while it is open. Blocks accumulate into one write
+           batch and go to the database every blocksPerWrite of them, instead of
+           one database write per block - a block's batch is only a few dozen
+           kilobytes and the per write overhead dominates it. And the two
+           lookups pushBlock would otherwise make against the database on every
+           single block, the timestamp index and the payment id counts, are
+           served from memory instead.
+
+           Those two are not independent: with writes buffered, a read that went
+           to the database could not see the blocks still sitting in the batch.
+           readDatabase flushes first for exactly that reason, so a memo miss
+           costs a flush rather than a wrong answer, and the memos are what keep
+           misses rare. Nothing outside the import may touch the cache while
+           this is open - it is single threaded by construction.
+
+           endBulkLoad flushes what is left and must be called before the cache
+           is used for anything else. The one caller pairs them with a scope
+           guard, so an exception on the way out cannot lose the tail. */
+        void beginBulkLoad(uint32_t blocksPerWrite);
+
+        void endBulkLoad();
+
       private:
         const Currency &currency;
 
@@ -359,6 +392,76 @@ namespace CryptoNote
         /* Height at and above which full block data is stored. Zero for a normal
            node, which stores everything. */
         uint32_t liteHeight = 0;
+
+        /* ---- Bulk load state. All of it is inert unless beginBulkLoad has been
+           called; see the comment on it. ---- */
+
+        /* How many blocks share one database write. Zero means bulk load is not
+           open, which is what every code path below tests. */
+        uint32_t bulkBatchBlockLimit = 0;
+
+        /* Mutable because readDatabase is const and has to flush before it can
+           answer, or it would read around the blocks still buffered here. */
+        mutable BlockchainWriteBatch bulkBatch;
+
+        mutable uint32_t bulkBatchBlocks = 0;
+
+        /* Set when any block in the pending batch wanted a durable write, so
+           merging blocks together cannot quietly downgrade one. */
+        mutable bool bulkBatchNeedsSync = false;
+
+        /* Whether a memo miss proves the record is simply not there.
+
+           True only when the database held nothing above genesis when the bulk
+           load opened - the ordinary import. Neither table has an entry for
+           genesis: addGenesisBlock writes no timestamp index entry, and the
+           genesis coinbase carries no payment id. So on such a database the two
+           tables start empty, and everything in them afterwards is something
+           this bulk load put there and therefore remembers.
+
+           On a resume onto an existing chain it stays false and the memos
+           degrade to plain caches, where a miss reads the database exactly as
+           it does outside a bulk load. */
+        bool bulkMemosAuthoritative = false;
+
+        /* The timestamp index entries written during this bulk load, newest
+           last, bounded so a long import cannot grow this without limit.
+
+           Once entries start being evicted a miss is only conclusive for a
+           timestamp above every timestamp evicted so far: had it been written
+           it would either still be here or have been evicted, and everything
+           evicted is at or below that mark. Block timestamps climb, so in
+           practice the test always passes and the per block database read
+           disappears; when it does not, the read still happens and is still
+           correct. */
+        std::unordered_map<uint64_t, std::vector<Crypto::Hash>> bulkTimestamps;
+
+        std::deque<uint64_t> bulkTimestampOrder;
+
+        uint64_t bulkTimestampsHighestEvicted = 0;
+
+        bool bulkTimestampsHaveEvicted = false;
+
+        /* Payment id transaction counts written during this bulk load. Payment
+           ids have no order to exploit, so once anything has been evicted no
+           miss is conclusive any more and every one of them reads - which under
+           a bulk load also costs a flush. The window is therefore sized to hold
+           every payment id a real chain has rather than to be small. */
+        std::unordered_map<Crypto::Hash, uint32_t> bulkPaymentIdCounts;
+
+        std::deque<Crypto::Hash> bulkPaymentIdOrder;
+
+        bool bulkPaymentIdsHaveEvicted = false;
+
+        /* Writes the pending bulk batch out and empties it. Const, and safe to
+           call when nothing is pending or bulk load is closed. */
+        void flushBulkBatch() const;
+
+        void rememberBulkTimestamp(uint64_t timestamp, const std::vector<Crypto::Hash> &blockHashes);
+
+        void rememberBulkPaymentIdCount(const Crypto::Hash &paymentId, uint32_t count);
+
+        void clearBulkLoadMemos();
 
         /* Whether the block about to be written falls in the index only region.
 

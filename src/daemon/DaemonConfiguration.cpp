@@ -128,9 +128,16 @@ namespace DaemonConfig
             "Export blockchain DB to a dump file",
             cxxopts::value<bool>(config.exportChain)->default_value("false")->implicit_value("true"))(
             "max-export-blocks",
-            "Maximum number of blocks for export to dump file.",
+            "Maximum number of blocks for export to dump file. Larger than the chain exports all of it",
             cxxopts::value<uint32_t>(),
             "#")(
+            "dump-file",
+            "Path the blockchain dump is read from and written to",
+            cxxopts::value<std::string>()->default_value(config.dumpFile),
+            "<file>")(
+            "import-validate",
+            "Fully verify every block while importing. Far slower, for a dump from a source you do not trust",
+            cxxopts::value<bool>(config.importValidate)->default_value("false")->implicit_value("true"))(
             "snapshot-info",
             "Print what a lite node snapshot file contains, as JSON, and exit",
             cxxopts::value<std::string>()->default_value(config.snapshotInfo),
@@ -507,6 +514,11 @@ namespace DaemonConfig
                 {
                     config.rewindToHeight = rewindHeight;
                 }
+            }
+
+            if (cli.count("dump-file") > 0)
+            {
+                config.dumpFile = cli["dump-file"].as<std::string>();
             }
 
             if (cli.count("max-export-blocks") > 0)
